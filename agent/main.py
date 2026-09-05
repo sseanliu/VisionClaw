@@ -103,7 +103,28 @@ ADD CONTACT: After a social scan (or when the user says "add to contacts", "save
 "add this person"), use the add_contact tool. If called right after a scan with no arguments,
 it automatically uses the scanned person's data. The contact is saved to SuiteCRM (the CRM).
 If SuiteCRM is not configured, it falls back to saving as a tagged note. A confirmation card
-appears on screen when saved."""
+appears on screen when saved.
+
+TECH X-RAY: When the user says "tech x-ray", "what is this device", "what laptop is that",
+or points at a product, use the tech_xray tool. It captures a frame, identifies the device
+from logos/model numbers, and returns specs, price, and reviews. Card shown on screen.
+
+COMPANY INTEL: When the user says "company intel", "what does this company do", "scan this
+booth", or points at a logo/booth, use the company_intel tool. It identifies the company and
+returns a brief: funding, team size, tech stack, recent news, competitors.
+
+WHITEBOARD CAPTURE: When the user says "capture this", "save this whiteboard", "scan this
+diagram", or points at a slide/diagram, use the capture_whiteboard tool. It transcribes all
+visible text and structure and saves it as a note.
+
+TECH TRIVIA: When the user says "fun fact", "tech trivia", "surprise me", or "tell me
+something interesting", use the tech_trivia tool. It identifies what's visible and finds a
+fascinating or lesser-known fact about it. Great for conference conversations.
+
+DEMO MODE: When the user says "demo mode", "start demo", "show me what this can do", or
+"introduce yourself" (especially to a new person), use the start_demo tool. It walks through
+all features with scripted narration and on-screen cards, pausing between each. After the
+demo, the viewer can try any feature for real by saying the trigger phrase."""
 
 
 class FrameHolder:
@@ -711,6 +732,446 @@ async def social_scan(ctx: RunContext[Userdata]) -> str:
         # Add a key fact from the bio
         spoken += f". {bio_text[:200]}"
     return spoken + ". Card shown on screen. Say 'add to contacts' to save them."
+
+
+# ---------------------------------------------------------------------------
+# Tech X-Ray — identify a device/product and return specs + review
+# ---------------------------------------------------------------------------
+
+@function_tool
+async def tech_xray(ctx: RunContext[Userdata]) -> str:
+    """Identify a device, product, or gadget in the camera frame and return
+    specs, price, and a quick review summary. Use when the user says
+    "what is this device", "tech x-ray", "what laptop is that", or similar.
+    Captures a single snapshot frame — no continuous video needed."""
+    image_b64 = encode_latest_frame(ctx.userdata.frames)
+    if not image_b64:
+        return "I don't have a camera frame. Make sure the camera is active and try again."
+
+    search_client = _get_search_client()
+    t0 = time.monotonic()
+
+    # Step 1: Vision model identifies the device
+    try:
+        resp = await search_client.aio.models.generate_content(
+            model=os.environ.get("QUICK_SEARCH_MODEL", "gemini-3.5-flash-lite"),
+            contents=[
+                genai_types.Part.from_bytes(data=base64.b64decode(image_b64), mime_type="image/jpeg"),
+                "Identify the device, product, or gadget in this image. Look for brand logos, "
+                "model numbers, form factors, distinctive design features. Return JSON: "
+                '{"name": "", "brand": "", "model": "", "category": "", "details": ""}. '
+                "If you cannot identify it, return {\"name\": null}.",
+            ],
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                thinking_config=genai_types.ThinkingConfig(thinking_level="low"),
+            ),
+        )
+        import json as _j
+        data = _j.loads(resp.text or "{}")
+    except Exception as e:
+        ctx.userdata.tracer.emit("agent_action", tool="tech_xray", error=True)
+        return f"I couldn't analyze the frame: {e}. Ask the user to describe it instead."
+
+    name = (data.get("name") or "").strip()
+    brand = (data.get("brand") or "").strip()
+    model = (data.get("model") or "").strip()
+    category = (data.get("category") or "").strip()
+
+    if not name:
+        return "I couldn't identify the device. Ask the user to tell you what it is, then use quick_search."
+
+    # Step 2: Search for specs/reviews
+    query = f"{name} {brand} {model} specs price review"
+    try:
+        search_resp = await search_client.aio.models.generate_content(
+            model=os.environ.get("QUICK_SEARCH_MODEL", "gemini-3.5-flash-lite"),
+            contents=query,
+            config=genai_types.GenerateContentConfig(
+                tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
+                thinking_config=genai_types.ThinkingConfig(thinking_level="low"),
+            ),
+        )
+        info_text = (search_resp.text or "").strip()
+    except Exception:
+        info_text = ""
+
+    latency = round(time.monotonic() - t0, 2)
+    ctx.userdata.tracer.emit("agent_action", tool="tech_xray", name=name, latency_s=latency)
+
+    # Show card
+    facts = [
+        {"label": "Device", "value": name},
+        {"label": "Brand", "value": brand or "—"},
+    ]
+    if model:
+        facts.append({"label": "Model", "value": model})
+    if category:
+        facts.append({"label": "Category", "value": category})
+
+    import json as _j2
+    await ctx.room.local_participant.send_text(
+        _j2.dumps({
+            "uuid": "tech-xray", "version": 1, "type": "info",
+            "title": name, "value": f"{brand} {model}".strip() or category,
+            "body": (info_text or "No specs found.")[:500],
+            "facts": facts,
+            "fallback_text": f"Tech X-Ray: {name}",
+        }), topic="vc.ui")
+
+    spoken = f"Tech X-Ray: {name}"
+    if brand:
+        spoken += f" by {brand}"
+    if info_text:
+        spoken += f". {info_text[:200]}"
+    return spoken + ". Card shown on screen."
+
+
+# ---------------------------------------------------------------------------
+# Company Intel — identify a company from a logo/booth and return a brief
+# ---------------------------------------------------------------------------
+
+@function_tool
+async def company_intel(ctx: RunContext[Userdata]) -> str:
+    """Identify a company from a logo, booth, or signage in the camera frame
+    and return a business intelligence brief: funding, team size, tech stack,
+    recent news, competitors. Use when the user says "what does this company
+    do", "company intel", "scan this booth", or similar."""
+    image_b64 = encode_latest_frame(ctx.userdata.frames)
+    if not image_b64:
+        return "I don't have a camera frame. Make sure the camera is active and try again."
+
+    search_client = _get_search_client()
+    t0 = time.monotonic()
+
+    # Step 1: Vision reads the company name/logo
+    try:
+        resp = await search_client.aio.models.generate_content(
+            model=os.environ.get("QUICK_SEARCH_MODEL", "gemini-3.5-flash-lite"),
+            contents=[
+                genai_types.Part.from_bytes(data=base64.b64decode(image_b64), mime_type="image/jpeg"),
+                "Identify the company from any visible logo, booth signage, or branding in this "
+                "image. Return JSON: {\"company\": \"\", \"tagline\": \"\", \"other_text\": \"\"}. "
+                "If you cannot identify the company, return {\"company\": null}.",
+            ],
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                thinking_config=genai_types.ThinkingConfig(thinking_level="low"),
+            ),
+        )
+        import json as _j3
+        data = _j3.loads(resp.text or "{}")
+    except Exception as e:
+        ctx.userdata.tracer.emit("agent_action", tool="company_intel", error=True)
+        return f"I couldn't analyze the frame: {e}."
+
+    company = (data.get("company") or "").strip()
+    tagline = (data.get("tagline") or "").strip()
+
+    if not company:
+        return "I couldn't identify the company. Ask the user to say the name and I'll search."
+
+    # Step 2: Search for company intel
+    query = f"{company} company funding team size tech stack competitors recent news"
+    try:
+        search_resp = await search_client.aio.models.generate_content(
+            model=os.environ.get("QUICK_SEARCH_MODEL", "gemini-3.5-flash-lite"),
+            contents=query,
+            config=genai_types.GenerateContentConfig(
+                tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
+                thinking_config=genai_types.ThinkingConfig(thinking_level="low"),
+            ),
+        )
+        intel_text = (search_resp.text or "").strip()
+    except Exception:
+        intel_text = ""
+
+    latency = round(time.monotonic() - t0, 2)
+    ctx.userdata.tracer.emit("agent_action", tool="company_intel", company=company, latency_s=latency)
+
+    import json as _j4
+    await ctx.room.local_participant.send_text(
+        _j4.dumps({
+            "uuid": "company-intel", "version": 1, "type": "info",
+            "title": company,
+            "value": tagline or "Company Brief",
+            "body": (intel_text or "No intel found.")[:500],
+            "facts": [
+                {"label": "Company", "value": company},
+                {"label": "Tagline", "value": tagline or "—"},
+            ],
+            "fallback_text": f"Company Intel: {company}",
+        }), topic="vc.ui")
+
+    spoken = f"Company Intel: {company}"
+    if intel_text:
+        spoken += f". {intel_text[:200]}"
+    return spoken + ". Card shown on screen."
+
+
+# ---------------------------------------------------------------------------
+# Capture Whiteboard — transcribe a whiteboard/diagram and save to notes
+# ---------------------------------------------------------------------------
+
+@function_tool
+async def capture_whiteboard(ctx: RunContext[Userdata], tag: str = "whiteboard") -> str:
+    """Capture and transcribe a whiteboard, diagram, or presentation slide
+    from the camera. Saves the transcribed content as a note. Use when the
+    user says "capture this", "save this whiteboard", "scan this diagram",
+    or "save this slide"."""
+    image_b64 = encode_latest_frame(ctx.userdata.frames)
+    if not image_b64:
+        return "I don't have a camera frame. Make sure the camera is active and try again."
+
+    search_client = _get_search_client()
+    t0 = time.monotonic()
+
+    try:
+        resp = await search_client.aio.models.generate_content(
+            model=os.environ.get("QUICK_SEARCH_MODEL", "gemini-3.5-flash-lite"),
+            contents=[
+                genai_types.Part.from_bytes(data=base64.b64decode(image_b64), mime_type="image/jpeg"),
+                "Transcribe ALL text, diagrams, labels, and structure visible in this image. "
+                "If it's a whiteboard, capture the full content including arrows, boxes, and "
+                "relationships. If it's a slide, capture the title, bullet points, and any "
+                "diagrams. Return as structured text, preserving hierarchy with indentation. "
+                "Do NOT add commentary — just transcribe what you see.",
+            ],
+            config=genai_types.GenerateContentConfig(
+                thinking_config=genai_types.ThinkingConfig(thinking_level="low"),
+            ),
+        )
+        transcribed = (resp.text or "").strip()
+    except Exception as e:
+        ctx.userdata.tracer.emit("agent_action", tool="capture_whiteboard", error=True)
+        return f"I couldn't read the frame: {e}."
+
+    if not transcribed:
+        return "I couldn't read any text from what I see. Ask the user to describe it."
+
+    # Save as a note
+    try:
+        await _notes_call("POST", ctx.userdata.user_id, {"text": transcribed, "tag": tag})
+    except Exception:
+        logger.exception("capture_whiteboard: note save failed")
+
+    latency = round(time.monotonic() - t0, 2)
+    ctx.userdata.tracer.emit("agent_action", tool="capture_whiteboard", tag=tag, latency_s=latency, text_len=len(transcribed))
+
+    import json as _j5
+    await ctx.room.local_participant.send_text(
+        _j5.dumps({
+            "uuid": "whiteboard-capture", "version": 1, "type": "info",
+            "title": f"Captured: {tag}",
+            "value": f"{len(transcribed)} characters",
+            "body": transcribed[:500],
+            "fallback_text": f"Whiteboard captured to {tag}",
+        }), topic="vc.ui")
+
+    return f"Captured and saved to {tag}. The content is on screen. {len(transcribed)} characters transcribed."
+
+
+# ---------------------------------------------------------------------------
+# Tech Trivia — find a fascinating fact about a visible company/tech
+# ---------------------------------------------------------------------------
+
+@function_tool
+async def tech_trivia(ctx: RunContext[Userdata]) -> str:
+    """Find a fascinating or surprising tech fact about a company or technology
+    visible in the camera frame. Great for sparking conversations at a booth or
+    trade show. Use when the user says "fun fact", "tech trivia", "tell me
+    something interesting about this", or "surprise me"."""
+    image_b64 = encode_latest_frame(ctx.userdata.frames)
+    if not image_b64:
+        return "I don't have a camera frame. Make sure the camera is active and try again."
+
+    search_client = _get_search_client()
+    t0 = time.monotonic()
+
+    # Step 1: Vision identifies the company/tech
+    try:
+        resp = await search_client.aio.models.generate_content(
+            model=os.environ.get("QUICK_SEARCH_MODEL", "gemini-3.5-flash-lite"),
+            contents=[
+                genai_types.Part.from_bytes(data=base64.b64decode(image_b64), mime_type="image/jpeg"),
+                "Identify the company, technology, or product visible in this image. "
+                "Return JSON: {\"subject\": \"\", \"type\": \"\"}. "
+                "If unidentifiable, return {\"subject\": null}.",
+            ],
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                thinking_config=genai_types.ThinkingConfig(thinking_level="low"),
+            ),
+        )
+        import json as _j6
+        data = _j6.loads(resp.text or "{}")
+    except Exception as e:
+        ctx.userdata.tracer.emit("agent_action", tool="tech_trivia", error=True)
+        return f"I couldn't analyze the frame: {e}."
+
+    subject = (data.get("subject") or "").strip()
+    subject_type = (data.get("type") or "").strip()
+
+    if not subject:
+        return "I couldn't identify what to find trivia about. Ask the user to name it."
+
+    # Step 2: Search for fascinating facts
+    query = f"fascinating surprising lesser-known fact trivia about {subject} {subject_type} history origin story"
+    try:
+        search_resp = await search_client.aio.models.generate_content(
+            model=os.environ.get("QUICK_SEARCH_MODEL", "gemini-3.5-flash-lite"),
+            contents=query,
+            config=genai_types.GenerateContentConfig(
+                tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
+                thinking_config=genai_types.ThinkingConfig(thinking_level="low"),
+            ),
+        )
+        trivia_text = (search_resp.text or "").strip()
+    except Exception:
+        trivia_text = ""
+
+    latency = round(time.monotonic() - t0, 2)
+    ctx.userdata.tracer.emit("agent_action", tool="tech_trivia", subject=subject, latency_s=latency)
+
+    import json as _j7
+    await ctx.room.local_participant.send_text(
+        _j7.dumps({
+            "uuid": "tech-trivia", "version": 1, "type": "info",
+            "title": f"Did you know? — {subject}",
+            "body": (trivia_text or "No trivia found.")[:500],
+            "fallback_text": f"Tech trivia about {subject}",
+        }), topic="vc.ui")
+
+    spoken = f"Here's something interesting about {subject}"
+    if trivia_text:
+        spoken += f". {trivia_text[:250]}"
+    return spoken + ". Card shown on screen."
+
+
+# ---------------------------------------------------------------------------
+# Demo Mode — scripted walkthrough of all features for showcasing
+# ---------------------------------------------------------------------------
+
+@function_tool
+async def start_demo(ctx: RunContext[Userdata]) -> str:
+    """Start a guided demo of VisionClaw's capabilities. Walks through each
+    feature with narration and on-screen cards, pausing between each so the
+    viewer can see the card. Use when the user says "demo mode", "start demo",
+    "show me what this can do", or "introduce yourself". The demo pauses after
+    each feature and tells the user what to point the camera at next."""
+    import json as _dj
+    room = ctx.room
+    t0 = time.monotonic()
+    ctx.userdata.tracer.emit("agent_action", tool="start_demo")
+
+    async def _card(payload: dict, delay: float = 3.0):
+        """Send a card and pause."""
+        await room.local_participant.send_text(_dj.dumps(payload), topic="vc.ui")
+        await asyncio.sleep(delay)
+
+    # Intro card
+    await _card({
+        "uuid": "demo-intro", "version": 1, "type": "info",
+        "title": "VisionClaw",
+        "value": "AI Glasses Assistant",
+        "body": "A walkthrough of what VisionClaw can do with smart glasses + AI.",
+        "facts": [
+            {"label": "Feature 1", "value": "Social Scan — identify people from name tags"},
+            {"label": "Feature 2", "value": "Tech X-Ray — identify devices + specs"},
+            {"label": "Feature 3", "value": "Company Intel — scan booths for company briefs"},
+            {"label": "Feature 4", "value": "Whiteboard Capture — transcribe diagrams"},
+            {"label": "Feature 5", "value": "Tech Trivia — fascinating facts about what you see"},
+            {"label": "Feature 6", "value": "Add to Contacts — save people to CRM"},
+        ],
+        "fallback_text": "VisionClaw demo mode",
+    }, delay=4)
+
+    yield_msg = "Welcome to VisionClaw. I'm an AI assistant that lives in your glasses. "
+    yield_msg += "I can see what you see and help you in real time. "
+    yield_msg += "Let me walk you through what I can do. "
+    yield_msg += "After each demo, point your camera at the next thing I mention. "
+    yield_msg += "Say 'next' when you're ready to continue."
+
+    # Feature 1: Social Scan
+    await _card({
+        "uuid": "demo-1", "version": 1, "type": "info",
+        "title": "1. Social Scan",
+        "value": "🔍 Identify people from name tags",
+        "body": "Point the camera at someone's name tag. I'll read their name, company, and title, "
+                "then search the web for their public bio. Say 'scan this person' to try it.",
+        "fallback_text": "Demo: Social Scan",
+    }, delay=3)
+    yield_msg += " First: Social Scan. Point at a name tag and say 'scan this person'. I'll read their name and find their bio."
+
+    # Feature 2: Tech X-Ray
+    await _card({
+        "uuid": "demo-2", "version": 1, "type": "info",
+        "title": "2. Tech X-Ray",
+        "value": "🔬 Identify devices + specs",
+        "body": "Point at any device — a laptop, phone, gadget. I'll identify it and pull specs, "
+                "price, and reviews. Say 'tech x-ray' to try it.",
+        "fallback_text": "Demo: Tech X-Ray",
+    }, delay=3)
+    yield_msg += " Next: Tech X-Ray. Point at any device and say 'tech x-ray'. I'll tell you what it is and its specs."
+
+    # Feature 3: Company Intel
+    await _card({
+        "uuid": "demo-3", "version": 1, "type": "info",
+        "title": "3. Company Intel",
+        "value": "📡 Scan booths for company briefs",
+        "body": "Point at a company logo or booth. I'll identify the company and pull funding info, "
+                "team size, tech stack, and recent news. Say 'company intel' to try it.",
+        "fallback_text": "Demo: Company Intel",
+    }, delay=3)
+    yield_msg += " Next: Company Intel. Point at a booth and say 'company intel'. I'll give you a full brief."
+
+    # Feature 4: Whiteboard Capture
+    await _card({
+        "uuid": "demo-4", "version": 1, "type": "info",
+        "title": "4. Whiteboard Capture",
+        "value": "📝 Transcribe diagrams + slides",
+        "body": "Point at a whiteboard, diagram, or presentation slide. I'll transcribe everything "
+                "and save it to your notes. Say 'capture this' to try it.",
+        "fallback_text": "Demo: Whiteboard Capture",
+    }, delay=3)
+    yield_msg += " Next: Whiteboard Capture. Point at a diagram and say 'capture this'."
+
+    # Feature 5: Tech Trivia
+    await _card({
+        "uuid": "demo-5", "version": 1, "type": "info",
+        "title": "5. Tech Trivia",
+        "value": "🎲 Fascinating facts about what you see",
+        "body": "Point at any company or technology. I'll find a surprising or lesser-known fact "
+                "about them. Great for sparking conversations. Say 'fun fact' to try it.",
+        "fallback_text": "Demo: Tech Trivia",
+    }, delay=3)
+    yield_msg += " Next: Tech Trivia. Point at a company and say 'fun fact'."
+
+    # Feature 6: Add to Contacts
+    await _card({
+        "uuid": "demo-6", "version": 1, "type": "info",
+        "title": "6. Add to Contacts",
+        "value": "📇 Save people to CRM",
+        "body": "After scanning someone, say 'add to contacts' and I'll save them to SuiteCRM "
+                "automatically. No typing, no business cards.",
+        "fallback_text": "Demo: Add to Contacts",
+    }, delay=3)
+    yield_msg += " Finally: Add to Contacts. After scanning someone, say 'add to contacts' and I'll save them to your CRM."
+
+    # Outro
+    await _card({
+        "uuid": "demo-outro", "version": 1, "type": "info",
+        "title": "That's VisionClaw",
+        "value": "6 features, zero typing",
+        "body": "All powered by a single pair of smart glasses + AI. "
+                "Say any command to try a feature for real, or say 'demo mode' to replay this.",
+        "fallback_text": "VisionClaw demo complete",
+    }, delay=2)
+
+    latency = round(time.monotonic() - t0, 2)
+    ctx.userdata.tracer.emit("agent_action", tool="start_demo", complete=True, latency_s=latency)
+
+    return yield_msg + " The demo cards are on screen. Say 'next' or ask me to try any feature for real."
 
 
 # ---------------------------------------------------------------------------
@@ -1421,7 +1882,7 @@ async def entrypoint(ctx: JobContext):
     await session.start(
         agent=Agent(
             instructions=INSTRUCTIONS,
-            tools=[execute, browse, quick_search, show_card, save_note, recall_notes, delete_note, social_scan, add_contact],
+            tools=[execute, browse, quick_search, show_card, save_note, recall_notes, delete_note, social_scan, add_contact, tech_xray, company_intel, capture_whiteboard, tech_trivia, start_demo],
         ),
         room=ctx.room,
         # Video is opt-in (RoomInputOptions.video_enabled defaults to False);
