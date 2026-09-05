@@ -438,13 +438,17 @@ app.post("/livekit-token", async (req, res) => {
   // setup and greeting time.
   void ensureUser(userId).catch((err) => console.warn(`[provision] pre-warm failed for ${userId}:`, err));
   const { AccessToken } = await import("livekit-server-sdk");
-  // The engine choice (gemini | openai) rides as participant metadata; the
+  // The engine choice (gemini | openai | openclaw) rides as participant metadata; the
   // worker reads it when the user joins and picks the realtime model.
-  const engine = req.body?.engine === "openai" ? "openai" : "gemini";
+  // For openclaw, agentSessionKey routes to a specific agent (e.g. "agent:coo:glass").
+  const engine = ["openai", "openclaw"].includes(req.body?.engine) ? req.body.engine : "gemini";
+  const agentSessionKey = typeof req.body?.agentSessionKey === "string" ? req.body.agentSessionKey : undefined;
+  const metadata: Record<string, unknown> = { engine };
+  if (agentSessionKey) metadata.agentSessionKey = agentSessionKey;
   const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
     identity: userId,
     ttl: "15m",
-    metadata: JSON.stringify({ engine }),
+    metadata: JSON.stringify(metadata),
   });
   // One room per call, not per user: agent dispatch fires on room creation,
   // so a redial into a still-draining room from the previous call would get

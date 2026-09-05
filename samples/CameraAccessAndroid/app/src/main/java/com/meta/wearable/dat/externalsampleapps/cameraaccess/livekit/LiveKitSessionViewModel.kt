@@ -146,6 +146,8 @@ data class LiveKitUiState(
     val glassesStreaming: Boolean = false,
     val caption: Caption? = null,
     val card: UiCard? = null,
+    // Video can be muted during a call to save glasses battery — voice continues.
+    val videoMuted: Boolean = false,
 ) {
     val isActive: Boolean
         get() = state == SessionState.Connected || state == SessionState.Connecting
@@ -590,6 +592,7 @@ class LiveKitSessionViewModel(
                 zoomFactor = 1f,
                 caption = null,
                 card = null,
+                videoMuted = false,
             )
         }
     }
@@ -757,8 +760,67 @@ class LiveKitSessionViewModel(
     fun unfreeze() {
         if (_uiState.value.frozenFrame == null) return
         _uiState.update { it.copy(frozenFrame = null) }
-        if (_uiState.value.state == SessionState.Connected) {
+        if (_uiState.value.state == SessionState.Connected && !_uiState.value.videoMuted) {
             room.localParticipant.getTrackPublication(Track.Source.CAMERA)?.muted = false
+        }
+    }
+
+    // MARK: Video mute (voice-only mode)
+
+    /**
+     * Toggle video publishing during a call without dropping audio. When muted,
+     * the glasses stop streaming (battery save) and the agent receives no video
+     * frames — voice continues uninterrupted. The camera preview also stops so
+     * the glasses fully power down their video pipeline.
+     */
+    fun toggleVideoMute() {
+        val current = _uiState.value
+        if (current.state != SessionState.Connected) return
+        val newMuted = !current.videoMuted
+
+        if (newMuted) {
+            // Mute: stop publishing video to save glasses battery
+            if (current.isGlassesSource) {
+                // For glasses: stop the video track entirely so the glasses
+                // can power down their camera pipeline
+                current.localVideoTrack?.let { track ->
+                    track.stopCapture()
+                    room.localParticipant.unpublishTrack(track)
+                }
+            } else {
+                // For phone camera: mute the track (camera stays warm for quick resume)
+                room.localParticipant.getTrackPublication(Track.Source.CAMERA)?.muted = true
+            }
+            _uiState.update { it.copy(videoMuted = true, localVideoTrack = null) }
+        } else {
+            // Unmute: resume video publishing
+            if (current.isGlassesSource) {
+                // Restart glasses video track
+                viewModelScope.launch {
+                    try {
+                        ensureGlassesFeed()
+                        val capturer = GlassesVideoCapturer()
+                        val glassesTrack = room.localParticipant.createVideoTrack(
+                            name = "glasses",
+                            capturer = capturer,
+                        )
+                        glassesCapturer = capturer
+                        glassesTrack.startCapture()
+                        room.localParticipant.publishVideoTrack(glassesTrack)
+                        attachGrabber(glassesTrack)
+                        _uiState.update { it.copy(videoMuted = false, localVideoTrack = glassesTrack) }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "failed to resume glasses video: ${e.message}")
+                        _uiState.update { it.copy(videoMuted = false) }
+                    }
+                }
+            } else {
+                // Unmute phone camera
+                room.localParticipant.getTrackPublication(Track.Source.CAMERA)?.muted = false
+                val track = room.localParticipant
+                    .getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack
+                _uiState.update { it.copy(videoMuted = false, localVideoTrack = track) }
+            }
         }
     }
 
@@ -802,6 +864,12 @@ class LiveKitSessionViewModel(
         val baseUrl = SettingsManager.gatewayBaseUrl.trimEnd('/')
         val body = JSONObject()
             .put("engine", engine.value)
+            .apply {
+                // For OpenClaw engine, pass the agent session key for routing
+                if (engine == IntelligenceEngine.OPENCLAW) {
+                    put("agentSessionKey", SettingsManager.openClawSessionKey)
+                }
+            }
             .toString()
             .toRequestBody("application/json".toMediaType())
         val request = Request.Builder()

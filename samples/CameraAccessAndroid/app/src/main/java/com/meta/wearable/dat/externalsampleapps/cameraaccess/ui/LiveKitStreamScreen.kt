@@ -377,6 +377,21 @@ fun LiveKitStreamScreen(
                 onStop = { viewModel.stop() },
             )
         }
+        // Video mute toggle: voice-only mode to save glasses battery.
+        // Only shown during an active call.
+        if (uiState.state is SessionState.Connected) {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .navigationBarsPadding()
+                    .padding(end = 24.dp, bottom = 32.dp),
+            ) {
+                VideoMuteButton(
+                    isMuted = uiState.videoMuted,
+                    onClick = { viewModel.toggleVideoMute() },
+                )
+            }
+        }
     }
 }
 
@@ -725,5 +740,43 @@ private fun FreezeButton(
                 .clip(CircleShape)
                 .background(color),
         )
+    }
+}
+
+/**
+ * Video mute toggle: voice-only mode to save glasses battery.
+ * When muted, the glasses stop streaming video but voice continues.
+ * Camera icon with a slash when muted, plain camera when active.
+ */
+@Composable
+private fun VideoMuteButton(
+    isMuted: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    IconButton(
+        onClick = onClick,
+        modifier = modifier
+            .size(56.dp)
+            .clip(CircleShape)
+            .background(Color.Black.copy(alpha = 0.5f)),
+    ) {
+        if (isMuted) {
+            // Video off: camera with slash
+            Icon(
+                painter = painterResource(id = android.R.drawable.ic_menu_camera),
+                contentDescription = "Video muted — tap to resume",
+                tint = Color.White,
+                modifier = Modifier.size(24.dp),
+            )
+        } else {
+            // Video on: camera
+            Icon(
+                painter = painterResource(id = android.R.drawable.ic_menu_camera),
+                contentDescription = "Video on — tap to mute",
+                tint = AppColor.Yellow,
+                modifier = Modifier.size(24.dp),
+            )
+        }
     }
 }
