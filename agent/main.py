@@ -91,7 +91,19 @@ website, including shopping or adding to a cart, use browse instead, even when t
 "an action". Speak a brief natural acknowledgment BEFORE calling it, never call it silently. Results may arrive as a follow-up; relay them as the
 answer to what was asked, not as a notification. If the task is about something the user
 is showing on camera, set attach_view=true so the actual image travels with the task --
-still describe what you see in the task text as well."""
+still describe what you see in the task text as well.
+
+SOCIAL SCAN: When the user says "scan this person", "who is this", "look them up", or similar,
+use the social_scan tool. It captures a single frame from the camera, reads the person's name
+tag or badge, and searches the web for their public bio. A card with their info appears on screen.
+This works without continuous video streaming — one snapshot frame is enough. If no name is
+visible, ask the user to say the person's name and use quick_search instead.
+
+ADD CONTACT: After a social scan (or when the user says "add to contacts", "save contact",
+"add this person"), use the add_contact tool. If called right after a scan with no arguments,
+it automatically uses the scanned person's data. The contact is saved to SuiteCRM (the CRM).
+If SuiteCRM is not configured, it falls back to saving as a tagged note. A confirmation card
+appears on screen when saved."""
 
 
 class FrameHolder:
@@ -203,6 +215,8 @@ class Userdata:
     # model tends to re-fire the tool when the first is slow (double-fire), and
     # two live CUA runs mean double cost and duplicate relays.
     browse_job: "asyncio.Future[str] | None" = None
+    # Last social_scan result, so add_contact can use it without re-scanning.
+    last_scan: dict | None = None
 
 
 _RELAY_STOPWORDS = {"finished", "earlier", "result", "research", "summary", "shopping", "however", "because"}
@@ -550,6 +564,294 @@ async def delete_note(ctx: RunContext[Userdata], match: str, tag: str | None = N
     ctx.userdata.tracer.emit("agent_action", tool="delete_note", match=match, tag=tag, deleted=deleted)
     await _push_notes_card(ctx, tag)
     return f"Removed: {deleted}. The updated list card is already on screen; confirm briefly."
+
+
+# ---------------------------------------------------------------------------
+# Social Scan — capture a single frame from the glasses, read a name tag,
+# search the web for that person, and return a bio card. Battery-friendly:
+# no continuous video streaming needed.
+# ---------------------------------------------------------------------------
+
+@function_tool
+async def social_scan(ctx: RunContext[Userdata]) -> str:
+    """Scan the person in front of the camera: capture a single frame, read
+    their name tag (name, company, role), and search the web for their public
+    profile. Returns a bio summary and shows a card on screen. Use when the
+    user says "scan this person", "who is this", or "look them up". Works
+    without continuous video — captures one snapshot frame."""
+    t0 = time.monotonic()
+    # Grab the current frame from the video track (or a frozen one)
+    image_b64 = encode_latest_frame(ctx.userdata.frames)
+    if not image_b64:
+        return ("I don't have a camera frame to scan. Make sure the glasses or phone camera "
+                "is active, then try again.")
+
+    # Step 1: Use Gemini vision to extract name/company from the frame (name tag reading)
+    try:
+        search_client = _get_search_client()
+        vision_resp = await search_client.aio.models.generate_content(
+            model=os.environ.get("QUICK_SEARCH_MODEL", "gemini-3.5-flash-lite"),
+            contents=[
+                genai_types.Part.from_bytes(data=base64.b64decode(image_b64), mime_type="image/jpeg"),
+                "Extract the person's name and affiliation from any visible name tag, badge, or "
+                "text in this image. Also note any other visible details (company logo, job title, "
+                "event name). Return as JSON: {\"name\": \"\", \"company\": \"\", \"title\": \"\", "
+                "\"other\": \"\"}. If no name is visible, return {\"name\": null}.",
+            ],
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                thinking_config=genai_types.ThinkingConfig(thinking_level="low"),
+            ),
+        )
+        import json as _json
+        vision_data = _json.loads(vision_resp.text or "{}")
+    except Exception as e:
+        logger.exception("social_scan vision failed: user=%s", ctx.userdata.user_id)
+        ctx.userdata.tracer.emit("agent_action", tool="social_scan", error=True, stage="vision")
+        return f"I couldn't read the frame. Error: {e}. Ask the user to say the person's name instead."
+
+    name = (vision_data.get("name") or "").strip()
+    company = (vision_data.get("company") or "").strip()
+    title = (vision_data.get("title") or "").strip()
+    other = (vision_data.get("other") or "").strip()
+
+    if not name:
+        ctx.userdata.tracer.emit("agent_action", tool="social_scan", stage="vision", no_name=True)
+        return ("I couldn't read a name from what I see. Ask the user to say the person's name "
+                "and company, then use quick_search to look them up.")
+
+    logger.info("social_scan: name=%s company=%s title=%s", name, company, title)
+
+    # Step 2: Web search for the person
+    query_parts = [name]
+    if company:
+        query_parts.append(company)
+    if title:
+        query_parts.append(title)
+    query = " ".join(query_parts)
+    # Add LinkedIn/social hints
+    search_query = f"{name} {company} {title} LinkedIn bio background".strip()
+
+    try:
+        search_resp = await search_client.aio.models.generate_content(
+            model=os.environ.get("QUICK_SEARCH_MODEL", "gemini-3.5-flash-lite"),
+            contents=search_query,
+            config=genai_types.GenerateContentConfig(
+                tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
+                thinking_config=genai_types.ThinkingConfig(thinking_level="low"),
+            ),
+        )
+        bio_text = (search_resp.text or "").strip()
+    except Exception:
+        logger.exception("social_scan search failed: user=%s query=%r", ctx.userdata.user_id, search_query[:120])
+        bio_text = ""
+
+    # Step 3: Build and show a bio card
+    facts = []
+    if name:
+        facts.append({"label": "Name", "value": name})
+    if title:
+        facts.append({"label": "Title", "value": title})
+    if company:
+        facts.append({"label": "Company", "value": company})
+    if other:
+        facts.append({"label": "Notes", "value": other})
+
+    # If search found bio info, add a summary
+    if bio_text:
+        # Truncate to keep card readable
+        bio_summary = bio_text[:500]
+    else:
+        bio_summary = "No public bio found."
+
+    latency = round(time.monotonic() - t0, 2)
+    logger.info("social_scan complete: name=%s latency_s=%.2f bio_len=%d", name, latency, len(bio_text or ""))
+    ctx.userdata.tracer.emit(
+        "agent_action",
+        tool="social_scan",
+        name=name,
+        company=company,
+        title=title,
+        latency_s=latency,
+        bio_len=len(bio_text or ""),
+    )
+
+    # Store scan result in userdata so add_contact can use it
+    ctx.userdata.last_scan = {
+        "name": name,
+        "title": title,
+        "company": company,
+        "other": other,
+        "bio": bio_text or "",
+    }
+
+    # Show a card with the scan results
+    import json as _json2
+    await ctx.room.local_participant.send_text(
+        _json2.dumps({
+            "uuid": "social-scan",
+            "version": 1,
+            "type": "info",
+            "title": name,
+            "value": f"{title} at {company}" if title and company else (title or company or ""),
+            "body": bio_summary,
+            "facts": facts,
+            "fallback_text": f"{name}, {title} at {company}" if title and company else name,
+        }),
+        topic="vc.ui",
+    )
+
+    # Spoken summary for the user
+    spoken = f"Scanned: {name}"
+    if title:
+        spoken += f", {title}"
+    if company:
+        spoken += f" at {company}"
+    if bio_text:
+        # Add a key fact from the bio
+        spoken += f". {bio_text[:200]}"
+    return spoken + ". Card shown on screen. Say 'add to contacts' to save them."
+
+
+# ---------------------------------------------------------------------------
+# Add Contact — push contact info to SuiteCRM via REST API
+# ---------------------------------------------------------------------------
+
+@function_tool
+async def add_contact(
+    ctx: RunContext[Userdata],
+    first_name: str | None = None,
+    last_name: str | None = None,
+    email: str | None = None,
+    phone: str | None = None,
+    company: str | None = None,
+    title: str | None = None,
+    notes: str | None = None,
+) -> str:
+    """Add a contact to the CRM (SuiteCRM). Use after a social scan or when
+    the user says "add this person to contacts", "save contact", or "add to
+    my contacts". If called right after social_scan with no arguments, it
+    uses the scanned person's data automatically."""
+    # If no name provided, try to use the last scan result
+    if not first_name and not last_name and hasattr(ctx.userdata, 'last_scan') and ctx.userdata.last_scan:
+        scan = ctx.userdata.last_scan
+        full_name = scan.get("name", "")
+        # Try to split into first/last
+        parts = full_name.split(" ", 1)
+        first_name = parts[0] if parts else ""
+        last_name = parts[1] if len(parts) > 1 else ""
+        if not company:
+            company = scan.get("company", "")
+        if not title:
+            title = scan.get("title", "")
+        if not notes:
+            bio = scan.get("bio", "")
+            other = scan.get("other", "")
+            note_parts = []
+            if bio:
+                note_parts.append(f"Bio: {bio[:300]}")
+            if other:
+                note_parts.append(f"Notes: {other}")
+            notes = " | ".join(note_parts) if note_parts else None
+        logger.info("add_contact: using scan data for %s %s", first_name, last_name)
+
+    if not first_name and not last_name:
+        return ("I don't have a name to save. Either scan the person first (say 'scan this person') "
+                "or tell me their name.")
+
+    # SuiteCRM REST API
+    suitecrm_url = os.environ.get("SUITECRM_URL", "").rstrip("/")
+    suitecrm_token = os.environ.get("SUITECRM_TOKEN", "")
+
+    if not suitecrm_url or not suitecrm_token:
+        # Fallback: save as a note instead
+        contact_summary = f"{first_name} {last_name or ''}".strip()
+        if company:
+            contact_summary += f" ({company})"
+        if title:
+            contact_summary += f" - {title}"
+        if email:
+            contact_summary += f" email={email}"
+        if phone:
+            contact_summary += f" phone={phone}"
+        if notes:
+            contact_summary += f" notes={notes}"
+        try:
+            await _notes_call("POST", ctx.userdata.user_id, {"text": contact_summary, "tag": "contacts"})
+            ctx.userdata.tracer.emit("agent_action", tool="add_contact", fallback="note", name=contact_summary)
+            return f"SuiteCRM not configured. Saved {contact_summary} as a note with tag 'contacts' instead."
+        except Exception:
+            return "I couldn't save the contact — SuiteCRM is not configured and the note also failed."
+
+    # Build SuiteCRM contact payload
+    contact_data = {
+        "data": {
+            "type": "Contacts",
+            "attributes": {
+                "first_name": first_name or "",
+                "last_name": last_name or "",
+                "title": title or "",
+                "account_name": company or "",
+                "email1": email or "",
+                "phone_work": phone or "",
+                "description": notes or "",
+            },
+        }
+    }
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {suitecrm_token}",
+            "Content-Type": "application/vnd.api+json",
+            "Accept": "application/vnd.api+json",
+        }
+        async with aiohttp.ClientSession() as http:
+            async with http.post(
+                f"{suitecrm_url}/Api/V8/module/Contacts",
+                headers=headers,
+                json=contact_data,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                body_text = await resp.text()
+                if resp.status in (200, 201):
+                    logger.info("add_contact: saved to SuiteCRM: %s %s", first_name, last_name)
+                    ctx.userdata.tracer.emit(
+                        "agent_action",
+                        tool="add_contact",
+                        name=f"{first_name} {last_name}",
+                        company=company,
+                        suitecrm=True,
+                    )
+                    display_name = f"{first_name} {last_name or ''}".strip()
+                    # Show confirmation card
+                    import json as _json3
+                    await ctx.room.local_participant.send_text(
+                        _json3.dumps({
+                            "uuid": "contact-saved",
+                            "version": 1,
+                            "type": "info",
+                            "title": "Contact Saved",
+                            "value": display_name,
+                            "facts": [
+                                {"label": "Name", "value": display_name},
+                                {"label": "Company", "value": company or "—"},
+                                {"label": "Title", "value": title or "—"},
+                                {"label": "Email", "value": email or "—"},
+                                {"label": "Phone", "value": phone or "—"},
+                                {"label": "CRM", "value": "SuiteCRM"},
+                            ],
+                            "fallback_text": f"Contact saved: {display_name}",
+                        }),
+                        topic="vc.ui",
+                    )
+                    return f"Contact saved to SuiteCRM: {display_name}" + (f" at {company}" if company else "") + ". Card shown."
+                else:
+                    logger.error("add_contact: SuiteCRM error %d: %s", resp.status, body_text[:200])
+                    return f"SuiteCRM returned an error (status {resp.status}). Tell the user the contact couldn't be saved."
+    except Exception as e:
+        logger.exception("add_contact: request failed")
+        ctx.userdata.tracer.emit("agent_action", tool="add_contact", error=True, stage="suitecrm")
+        return f"I couldn't reach SuiteCRM: {e}. Tell the user and offer to save as a note instead."
 
 
 async def _gateway_browse_start(user_id: str, task: str) -> dict:
@@ -1119,7 +1421,7 @@ async def entrypoint(ctx: JobContext):
     await session.start(
         agent=Agent(
             instructions=INSTRUCTIONS,
-            tools=[execute, browse, quick_search, show_card, save_note, recall_notes, delete_note],
+            tools=[execute, browse, quick_search, show_card, save_note, recall_notes, delete_note, social_scan, add_contact],
         ),
         room=ctx.room,
         # Video is opt-in (RoomInputOptions.video_enabled defaults to False);
