@@ -133,6 +133,29 @@ object SettingsManager {
         get() = prefs.getString("webrtcSignalingURL", null) ?: DEFAULT_SIGNALING_URL
         set(value) = prefs.edit().putString("webrtcSignalingURL", value).apply()
 
+    // --- OpenClaw direct connection settings ---
+
+    /** Base URL of the OpenClaw gateway (e.g. "https://openclaw.wembassy.com"). */
+    var openClawBaseUrl: String
+        get() = prefs.getString("openClawBaseUrl", null) ?: Secrets.openClawBaseUrl
+        set(value) = prefs.edit().putString("openClawBaseUrl", value).apply()
+
+    /** Gateway token for OpenClaw auth. */
+    var openClawToken: String
+        get() = prefs.getString("openClawToken", null) ?: Secrets.openClawToken
+        set(value) = prefs.edit().putString("openClawToken", value).apply()
+
+    /** Session key for agent routing (e.g. "agent:coo:glass" → Wren). */
+    var openClawSessionKey: String
+        get() = prefs.getString("openClawSessionKey", null) ?: Secrets.openClawSessionKey
+        set(value) = prefs.edit().putString("openClawSessionKey", value).apply()
+
+    /** Whether OpenClaw direct mode is configured (URL + token filled in). */
+    val isOpenClawConfigured: Boolean
+        get() = openClawBaseUrl.startsWith("http") &&
+            openClawToken.isNotEmpty() &&
+            !openClawToken.startsWith("YOUR_")
+
     fun resetAll() {
         prefs.edit().clear().apply()
         _captureSourceFlow.value = CaptureSource.PHONE

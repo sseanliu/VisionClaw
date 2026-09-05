@@ -50,8 +50,9 @@ import com.meta.wearable.dat.externalsampleapps.cameraaccess.settings.GatewayApi
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.settings.GatewayStatus
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.settings.IntelligenceEngine
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.settings.SettingsManager
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawAgent
 
-private enum class SettingsSubScreen { CONNECTED_APPS, RECENT_TASKS, GATEWAY }
+private enum class SettingsSubScreen { CONNECTED_APPS, RECENT_TASKS, GATEWAY, OPENCLAW }
 
 @Composable
 fun SettingsScreen(
@@ -64,6 +65,7 @@ fun SettingsScreen(
         SettingsSubScreen.CONNECTED_APPS -> ConnectedAppsScreen(onBack = { subScreen = null })
         SettingsSubScreen.RECENT_TASKS -> RecentTasksScreen(onBack = { subScreen = null })
         SettingsSubScreen.GATEWAY -> GatewaySettingsScreen(onBack = { subScreen = null })
+        SettingsSubScreen.OPENCLAW -> OpenClawSettingsScreen(onBack = { subScreen = null })
         null -> SettingsMainScreen(
             onBack = onBack,
             onOpen = { subScreen = it },
@@ -193,6 +195,10 @@ private fun SettingsMainScreen(
             // surfacing them as primary fields made a configured setup look
             // like one awaiting setup.
             NavigationRow("Gateway settings") { onOpen(SettingsSubScreen.GATEWAY) }
+
+            // OpenClaw direct connection (alternative to hosted gateway)
+            SectionHeader("OpenClaw")
+            NavigationRow("Direct Connection") { onOpen(SettingsSubScreen.OPENCLAW) }
 
             // Reset
             TextButton(onClick = { showResetDialog = true }) {
@@ -355,6 +361,87 @@ private fun GatewaySettingsScreen(
                 placeholder = "wss://your-server.example.com",
                 keyboardType = KeyboardType.Uri,
             )
+
+            Spacer(modifier = Modifier.height(32.dp))
+        }
+    }
+}
+
+/** OpenClaw direct connection: URL, token, and agent picker. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun OpenClawSettingsScreen(
+    onBack: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var openClawBaseUrl by remember { mutableStateOf(SettingsManager.openClawBaseUrl) }
+    var openClawToken by remember { mutableStateOf(SettingsManager.openClawToken) }
+    var openClawSessionKey by remember { mutableStateOf(SettingsManager.openClawSessionKey) }
+    var selectedAgent by remember { mutableStateOf(OpenClawAgent.fromSessionKey(openClawSessionKey)) }
+
+    fun saveAndClose() {
+        SettingsManager.openClawBaseUrl = openClawBaseUrl.trim()
+        SettingsManager.openClawToken = openClawToken.trim()
+        SettingsManager.openClawSessionKey = selectedAgent.sessionKey
+        onBack()
+    }
+
+    BackHandler { saveAndClose() }
+
+    Column(modifier = modifier.fillMaxSize()) {
+        TopAppBar(
+            title = { Text("OpenClaw Connection") },
+            navigationIcon = {
+                IconButton(onClick = { saveAndClose() }) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                }
+            },
+        )
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp)
+                .navigationBarsPadding(),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            SectionHeader("Gateway")
+            MonoTextField(
+                value = openClawBaseUrl,
+                onValueChange = { openClawBaseUrl = it },
+                label = "OpenClaw URL",
+                placeholder = "https://openclaw.wembassy.com",
+                keyboardType = KeyboardType.Uri,
+            )
+            MonoTextField(
+                value = openClawToken,
+                onValueChange = { openClawToken = it },
+                label = "Gateway Token",
+                placeholder = "Your OpenClaw gateway token",
+            )
+
+            SectionHeader("Agent")
+            FooterText("Routes messages to a specific Wembassy agent.")
+            OpenClawAgent.entries.forEach { agent ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { selectedAgent = agent }
+                        .padding(vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = agent.displayName,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = if (selectedAgent == agent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                    )
+                    if (selectedAgent == agent) {
+                        Text("✓", color = MaterialTheme.colorScheme.primary)
+                    }
+                }
+            }
 
             Spacer(modifier = Modifier.height(32.dp))
         }
