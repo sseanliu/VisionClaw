@@ -833,7 +833,37 @@ async def browse(ctx: RunContext[Userdata], task: str) -> str:
     return await _run_delegated(ctx, task, "browse", job, on_deliver=on_deliver)
 
 
-def build_llm(engine: str):
+def build_llm(engine: str, session_key: str | None = None):
+    if engine == "openclaw":
+        # OpenClaw direct mode: LiveKit is just the audio/video transport.
+        # User speech → Google STT → OpenClaw /v1/chat/completions → Google TTS → spoken reply.
+        # The session key routes to a specific agent (e.g. "agent:coo:glass" → Wren).
+        openclaw_url = os.environ.get("OPENCLAW_URL", "https://openclaw.wembassy.com")
+        openclaw_token = os.environ.get("OPENCLAW_TOKEN", "")
+        openclaw_sk = session_key or os.environ.get("OPENCLAW_SESSION_KEY", "agent:main:glass")
+        if not openclaw_token:
+            logger.warning("openclaw engine selected but OPENCLAW_TOKEN unset; falling back to gemini")
+            engine = "gemini"
+        else:
+            logger.info("openclaw engine: url=%s session_key=%s", openclaw_url, openclaw_sk)
+            from livekit.plugins.openai import LLM as OpenAILLM
+            openclaw_llm = OpenAILLM(
+                model="openclaw",
+                base_url=f"{openclaw_url.rstrip('/')}/v1",
+                api_key=openclaw_token,
+                extra_headers={
+                    "x-openclaw-session-key": openclaw_sk,
+                    "x-openclaw-message-channel": "glass",
+                },
+            )
+            # Google STT + TTS for audio I/O (same provider as the default realtime model)
+            from livekit.plugins.google import STT as GoogleSTT, TTS as GoogleTTS
+            return {
+                "llm": openclaw_llm,
+                "stt": GoogleSTT(),
+                "tts": GoogleTTS(),
+            }
+
     if engine == "openai":
         if not os.environ.get("OPENAI_API_KEY"):
             logger.warning("openai engine requested but OPENAI_API_KEY unset; using gemini")
@@ -953,7 +983,8 @@ async def entrypoint(ctx: JobContext):
         meta = {}
     engine = meta.get("engine", "gemini")
     user_id = participant.identity or "demo"
-    logger.info("session start: user=%s engine=%s", user_id, engine)
+    agent_session_key = meta.get("agentSessionKey") or None
+    logger.info("session start: user=%s engine=%s agent=%s", user_id, engine, agent_session_key or "default")
 
     frames = FrameHolder()
     _watch_video(ctx, frames)
@@ -1043,8 +1074,26 @@ async def entrypoint(ctx: JobContext):
 
     show_card = function_tool(_show_card, name="show_card")
 
+    # Engine choice and agent routing come from participant metadata set by the app.
+    agent_session_key = meta.get("agentSessionKey") or None
     userdata = Userdata(user_id=user_id, frames=frames, tracer=tracer, room=ctx.room)
-    session = AgentSession(llm=build_llm(engine), userdata=userdata)
+    llm_result = build_llm(engine, session_key=agent_session_key)
+
+    if isinstance(llm_result, dict):
+        # OpenClaw mode: separate STT + LLM + TTS components
+        session = AgentSession(
+            stt=llm_result["stt"],
+            llm=llm_result["llm"],
+            tts=llm_result["tts"],
+            userdata=userdata,
+        )
+    else:
+        # Realtime mode (Gemini/OpenAI): single model handles audio I/O
+        session = AgentSession(llm=llm_result, userdata=userdata)
+
+    # When in OpenClaw mode, the agent's tools (execute, browse, etc.) still
+    # proxy through the VisionClaw gateway. The OpenClaw agent itself handles
+    # the conversation; tool calls are for the user's connected accounts.
 
     # The transcript pair the study runs on: final ASR of what the user said,
     # and the voice model's spoken reply (from output transcription). Items with

@@ -802,6 +802,12 @@ class LiveKitSessionViewModel(
         val baseUrl = SettingsManager.gatewayBaseUrl.trimEnd('/')
         val body = JSONObject()
             .put("engine", engine.value)
+            .apply {
+                // For OpenClaw engine, pass the agent session key for routing
+                if (engine == IntelligenceEngine.OPENCLAW) {
+                    put("agentSessionKey", SettingsManager.openClawSessionKey)
+                }
+            }
             .toString()
             .toRequestBody("application/json".toMediaType())
         val request = Request.Builder()

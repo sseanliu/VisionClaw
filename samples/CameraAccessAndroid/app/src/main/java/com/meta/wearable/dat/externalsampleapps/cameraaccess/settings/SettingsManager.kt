@@ -13,7 +13,8 @@ import kotlinx.coroutines.flow.asStateFlow
  */
 enum class IntelligenceEngine(val value: String, val label: String) {
     GEMINI("gemini", "Gemini"),
-    OPENAI("openai", "OpenAI");
+    OPENAI("openai", "OpenAI"),
+    OPENCLAW("openclaw", "OpenClaw");
 
     companion object {
         fun fromValue(value: String?): IntelligenceEngine =
